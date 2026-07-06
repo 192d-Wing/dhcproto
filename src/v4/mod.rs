@@ -470,26 +470,30 @@ impl Message {
     }
 }
 
-/// Length in bytes of the option TLVs at the start of `field`, up to (but not
-/// including) the first `End` marker. Stops early on a truncated option so the
-/// result is always a valid slice bound into `field`.
-fn options_len(field: &[u8]) -> usize {
+/// Copy the option TLVs at the start of `field` into `combined`, up to the
+/// first `End` marker. `Pad` bytes and the `OptionOverload` (52) marker are
+/// dropped so that the fragments of an option split across a region boundary
+/// (RFC 3396) are left adjacent and get concatenated when decoded. Stops early
+/// on a truncated option so it never reads out of bounds.
+fn append_region_options(combined: &mut Vec<u8>, field: &[u8]) {
     let mut i = 0;
     while i < field.len() {
         match field[i] {
             255 => break, // End
-            0 => i += 1,  // Pad
-            _ => {
+            0 => i += 1,  // Pad - dropped
+            code => {
                 let Some(&len) = field.get(i + 1) else { break };
                 let end = i + 2 + len as usize;
                 if end > field.len() {
                     break; // truncated option
                 }
+                if code != u8::from(OptionCode::OptionOverload) {
+                    combined.extend_from_slice(&field[i..end]);
+                }
                 i = end;
             }
         }
     }
-    i
 }
 
 impl Decodable for Message {
@@ -526,23 +530,22 @@ impl Decodable for Message {
             _ => 0,
         };
         if overload != 0 {
-            // Concatenate the option streams of every active region into one
-            // buffer and decode it in a single pass, so an option split across
-            // a region boundary (RFC 3396) is reassembled rather than dropped.
+            // Splice the option streams of every active region into one buffer
+            // and decode it in a single pass, so an option split across a region
+            // boundary (RFC 3396) is reassembled rather than dropped. Pad and the
+            // option-52 marker are dropped while splicing so split fragments stay
+            // adjacent (and the marker doesn't survive into the flattened map).
             // Region order: options -> file -> sname.
             let mut combined = Vec::with_capacity(opts_raw.len() + 192);
-            combined.extend_from_slice(&opts_raw[..options_len(opts_raw)]);
+            append_region_options(&mut combined, opts_raw);
             if overload & 0b01 != 0 {
-                combined.extend_from_slice(&file_raw[..options_len(&file_raw)]);
+                append_region_options(&mut combined, &file_raw);
             }
             if overload & 0b10 != 0 {
-                combined.extend_from_slice(&sname_raw[..options_len(&sname_raw)]);
+                append_region_options(&mut combined, &sname_raw);
             }
             combined.push(255); // End
             opts = DhcpOptions::decode(&mut Decoder::new(&combined))?;
-            // The marker no longer reflects reality once the fields are
-            // flattened into the options map (we don't re-overload on encode).
-            opts.remove(OptionCode::OptionOverload);
         }
 
         // An overloaded field carries options, not a name.
@@ -829,6 +832,40 @@ mod tests {
         // `sname` (part 2) regions must be reassembled per RFC 3396. Each region
         // holds one same-code fragment; after concatenation the value is "abcdef".
         let file_opts = [15u8, 3, b'a', b'b', b'c', 255];
+        let sname_opts = [15u8, 3, b'd', b'e', b'f', 255];
+        let bytes = overload_msg(3, &[53, 1, 1], &sname_opts, &file_opts);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(
+            msg.opts().get(OptionCode::DomainName),
+            Some(&DhcpOption::DomainName("abcdef".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_rfc3396_split_main_to_file() -> Result<()> {
+        // Part 1 is the last real option in the MAIN field; the option-52 marker
+        // (appended after it by overload_msg) sits between the fragments on the
+        // wire. Reassembly must still span main -> file across that marker.
+        let main = [53u8, 1, 1, 15, 3, b'a', b'b', b'c'];
+        let file_opts = [15u8, 3, b'd', b'e', b'f', 255];
+        let bytes = overload_msg(1, &main, &[], &file_opts);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(
+            msg.opts().get(OptionCode::DomainName),
+            Some(&DhcpOption::DomainName("abcdef".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_split_across_padded_region() -> Result<()> {
+        // The file field holds part 1 but is not End-terminated, so overload_msg
+        // zero-pads it. Those Pad bytes must not break reassembly with part 2 in
+        // the sname field.
+        let file_opts = [15u8, 3, b'a', b'b', b'c']; // no End -> Pad-filled
         let sname_opts = [15u8, 3, b'd', b'e', b'f', 255];
         let bytes = overload_msg(3, &[53, 1, 1], &sname_opts, &file_opts);
         let msg = Message::decode(&mut Decoder::new(&bytes))?;
