@@ -469,26 +469,102 @@ impl Message {
     }
 }
 
+/// Trim a fixed-length header field at its first NUL, matching the semantics of
+/// [`Decoder::read_nul_bytes`]: a field that starts with NUL (or contains no NUL)
+/// decodes to `None`, otherwise the bytes up to and including the first NUL.
+fn trim_nul(bytes: &[u8]) -> Option<Vec<u8>> {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(0) => None,
+        Some(n) => Some(bytes[..=n].to_vec()),
+        None => None,
+    }
+}
+
+/// Parse the option block held in an overloaded `sname`/`file` field and merge
+/// it into `opts`. Follows a "first region wins" policy: a code already present
+/// (i.e. seen in an earlier region) is not overwritten. See RFC 2131 §4.1.
+fn merge_overloaded(opts: &mut DhcpOptions, field: &[u8]) -> DecodeResult<()> {
+    let extra = DhcpOptions::decode(&mut Decoder::new(field))?;
+    for (code, opt) in extra {
+        if !opts.contains(code) {
+            opts.insert(opt);
+        }
+    }
+    Ok(())
+}
+
 impl Decodable for Message {
     fn decode(decoder: &mut Decoder<'_>) -> DecodeResult<Self> {
+        let opcode = Opcode::decode(decoder)?;
+        let htype = decoder.read_u8()?.into();
+        let hlen = decoder.read_u8()?;
+        let hops = decoder.read_u8()?;
+        let xid = decoder.read_u32()?;
+        let secs = decoder.read_u16()?;
+        let flags = decoder.read_u16()?.into();
+        let ciaddr = decoder.read_u32()?.into();
+        let yiaddr = decoder.read_u32()?.into();
+        let siaddr = decoder.read_u32()?.into();
+        let giaddr = decoder.read_u32()?.into();
+        let chaddr = decoder.read::<16>()?;
+        // Keep the raw fixed-length fields around: whether they hold a
+        // hostname/bootfile or an overloaded option block isn't known until the
+        // options field has been parsed for option 52.
+        let sname_raw = decoder.read::<64>()?;
+        let file_raw = decoder.read::<128>()?;
+        // TODO: check magic bytes against expected?
+        let magic = decoder.read::<4>()?;
+        let mut opts = DhcpOptions::decode(decoder)?;
+
+        // Option Overload - RFC 2131 §4.1 / RFC 2132 §9.3
+        // value 1: `file` field holds options, 2: `sname` field holds options,
+        // 3: both. The option MUST appear in the main options field.
+        let overload = match opts.get(OptionCode::OptionOverload) {
+            Some(DhcpOption::OptionOverload(v)) => *v,
+            _ => 0,
+        };
+        // Interpretation order: options (done) -> file -> sname.
+        if overload & 0b01 != 0 {
+            merge_overloaded(&mut opts, &file_raw)?;
+        }
+        if overload & 0b10 != 0 {
+            merge_overloaded(&mut opts, &sname_raw)?;
+        }
+        // Once flattened into the options map, the overload marker no longer
+        // reflects reality (we don't re-produce overload on encode), so drop it.
+        if overload != 0 {
+            opts.remove(OptionCode::OptionOverload);
+        }
+
+        // An overloaded field carries options, not a name.
+        let sname = if overload & 0b10 != 0 {
+            None
+        } else {
+            trim_nul(&sname_raw)
+        };
+        let fname = if overload & 0b01 != 0 {
+            None
+        } else {
+            trim_nul(&file_raw)
+        };
+
         Ok(Message {
-            opcode: Opcode::decode(decoder)?,
-            htype: decoder.read_u8()?.into(),
-            hlen: decoder.read_u8()?,
-            hops: decoder.read_u8()?,
-            xid: decoder.read_u32()?,
-            secs: decoder.read_u16()?,
-            flags: decoder.read_u16()?.into(),
-            ciaddr: decoder.read_u32()?.into(),
-            yiaddr: decoder.read_u32()?.into(),
-            siaddr: decoder.read_u32()?.into(),
-            giaddr: decoder.read_u32()?.into(),
-            chaddr: decoder.read::<16>()?,
-            sname: decoder.read_nul_bytes::<64>()?,
-            fname: decoder.read_nul_bytes::<128>()?,
-            // TODO: check magic bytes against expected?
-            magic: decoder.read::<4>()?,
-            opts: DhcpOptions::decode(decoder)?,
+            opcode,
+            htype,
+            hlen,
+            hops,
+            xid,
+            secs,
+            flags,
+            ciaddr,
+            yiaddr,
+            siaddr,
+            giaddr,
+            chaddr,
+            sname,
+            fname,
+            magic,
+            opts,
         })
     }
 }
@@ -648,6 +724,137 @@ mod tests {
         println!("{s}");
         let other = serde_json::from_str(&s)?;
         assert_eq!(msg, other);
+        Ok(())
+    }
+
+    /// Build a raw DHCPv4 message with the given option-52 overload value and the
+    /// given raw contents placed in the `sname`/`file` fields and the main
+    /// options area. The overload option and an `End` are appended to `main_opts`.
+    fn overload_msg(
+        overload: u8,
+        main_opts: &[u8],
+        sname_opts: &[u8],
+        file_opts: &[u8],
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[1, 1, 6, 0]); // op, htype, hlen, hops
+        v.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]); // xid
+        v.extend_from_slice(&[0, 0]); // secs
+        v.extend_from_slice(&[0, 0]); // flags
+        v.extend_from_slice(&[0; 16]); // ciaddr, yiaddr, siaddr, giaddr
+        v.extend_from_slice(&[0; 16]); // chaddr
+        let mut sname = [0u8; 64];
+        sname[..sname_opts.len()].copy_from_slice(sname_opts);
+        v.extend_from_slice(&sname);
+        let mut file = [0u8; 128];
+        file[..file_opts.len()].copy_from_slice(file_opts);
+        v.extend_from_slice(&file);
+        v.extend_from_slice(&MAGIC);
+        v.extend_from_slice(main_opts);
+        v.extend_from_slice(&[52, 1, overload]); // option overload
+        v.push(255); // end
+        v
+    }
+
+    #[test]
+    fn decode_option_overload_both() -> Result<()> {
+        // sname holds Hostname("host"), file holds DomainName("example")
+        let sname_opts = [12u8, 4, b'h', b'o', b's', b't', 255];
+        let file_opts = [15u8, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 255];
+        let bytes = overload_msg(3, &[53, 1, 1], &sname_opts, &file_opts);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(msg.opts().msg_type(), Some(MessageType::Discover));
+        assert_eq!(
+            msg.opts().get(OptionCode::Hostname),
+            Some(&DhcpOption::Hostname("host".into()))
+        );
+        assert_eq!(
+            msg.opts().get(OptionCode::DomainName),
+            Some(&DhcpOption::DomainName("example".into()))
+        );
+        // marker stripped; fields consumed as options
+        assert!(!msg.opts().contains(OptionCode::OptionOverload));
+        assert!(msg.sname().is_none());
+        assert!(msg.fname().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_file_only() -> Result<()> {
+        let file_opts = [15u8, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 255];
+        // value 1 overloads only `file`; sname stays a plain (nul-terminated) name
+        let bytes = overload_msg(1, &[53, 1, 1], b"myhost", &file_opts);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(
+            msg.opts().get(OptionCode::DomainName),
+            Some(&DhcpOption::DomainName("example".into()))
+        );
+        // sname preserved (matches read_nul_bytes: includes the terminating NUL)
+        assert_eq!(msg.sname(), Some(&b"myhost\0"[..]));
+        // sname was NOT parsed as options
+        assert!(!msg.opts().contains(OptionCode::Hostname));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_sname_only() -> Result<()> {
+        let sname_opts = [12u8, 4, b'h', b'o', b's', b't', 255];
+        // value 2 overloads only `sname`; file stays a plain (nul-terminated) name
+        let bytes = overload_msg(2, &[53, 1, 1], &sname_opts, b"boot.img");
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(
+            msg.opts().get(OptionCode::Hostname),
+            Some(&DhcpOption::Hostname("host".into()))
+        );
+        assert_eq!(msg.fname(), Some(&b"boot.img\0"[..]));
+        assert!(!msg.opts().contains(OptionCode::DomainName));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_first_wins() -> Result<()> {
+        // DomainName is present in the main options field ("main") AND the
+        // overloaded file field ("file"); the main field must win.
+        let main = [53u8, 1, 1, 15, 4, b'm', b'a', b'i', b'n'];
+        let file_opts = [15u8, 4, b'f', b'i', b'l', b'e', 255];
+        let bytes = overload_msg(1, &main, &[], &file_opts);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(
+            msg.opts().get(OptionCode::DomainName),
+            Some(&DhcpOption::DomainName("main".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_empty_fields() -> Result<()> {
+        // overload says "both", but the fields are all zero (Pad) - a no-op
+        let bytes = overload_msg(3, &[53, 1, 1], &[], &[]);
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(msg.opts().msg_type(), Some(MessageType::Discover));
+        assert!(!msg.opts().contains(OptionCode::OptionOverload));
+        assert!(msg.sname().is_none());
+        assert!(msg.fname().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_option_overload_absent() -> Result<()> {
+        // No option 52: sname/file are ordinary name fields and are NOT parsed
+        // as options even if they happen to look like one.
+        let bytes = overload_msg(0, &[53, 1, 1], b"srv", b"boot.img");
+        // overload_msg still appends `52,1,0`; a zero value means "not overloaded"
+        let msg = Message::decode(&mut Decoder::new(&bytes))?;
+
+        assert_eq!(msg.sname(), Some(&b"srv\0"[..]));
+        assert_eq!(msg.fname(), Some(&b"boot.img\0"[..]));
+        // a zero-valued overload option is left as-is in the map
+        assert!(msg.opts().contains(OptionCode::OptionOverload));
         Ok(())
     }
 
