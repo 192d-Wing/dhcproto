@@ -131,6 +131,44 @@ impl<'a> Message<'a> {
         }
         DhcpOptionIterator::new(&self.buffer[240..])
     }
+
+    /// The option 52 (Option Overload) value from the main options field, or 0
+    /// if the option is absent. See RFC 2131 §4.1 / RFC 2132 §9.3.
+    fn option_overload(&self) -> u8 {
+        self.opts()
+            .find(|opt| opt.code() == OptionCode::OptionOverload)
+            .and_then(|opt| opt.data().first().copied())
+            .unwrap_or(0)
+    }
+
+    /// Like [`opts`](Self::opts), but also yields the options carried in the
+    /// `sname`/`file` header fields when they are flagged as overloaded by
+    /// option 52 (RFC 2131 §4.1 / RFC 2132 §9.3).
+    ///
+    /// Options are yielded in region order: main options field, then `file`,
+    /// then `sname`. Unlike the owned [`Message`](crate::v4::Message) decoder,
+    /// this is a raw view and performs no de-duplication across regions, so a
+    /// code present in more than one region is yielded once per region. The
+    /// option 52 marker itself is also yielded (from the main field).
+    ///
+    /// This requires one extra pass over the main options field to locate
+    /// option 52; prefer [`opts`](Self::opts) when overload handling is not
+    /// needed.
+    pub fn opts_overloaded(&self) -> impl Iterator<Item = DhcpOption<'a>> + use<'a> {
+        let overload = self.option_overload();
+        // `file` before `sname` to match the owned decoder's ordering.
+        let file = if overload & 0b01 != 0 {
+            DhcpOptionIterator::new(&self.buffer[108..236])
+        } else {
+            DhcpOptionIterator::empty()
+        };
+        let sname = if overload & 0b10 != 0 {
+            DhcpOptionIterator::new(&self.buffer[44..108])
+        } else {
+            DhcpOptionIterator::empty()
+        };
+        self.opts().chain(file).chain(sname)
+    }
 }
 
 /// An iterator over DHCP options. Handles long-form encoding
@@ -311,6 +349,86 @@ mod tests {
             ]
         );
         assert!(msg.opts().next().is_none());
+    }
+
+    /// Build a raw DHCPv4 message with option-52 `overload`, and the given raw
+    /// contents in the `sname`/`file` fields and the main options area. The
+    /// overload option and an `End` are appended after `main_opts`.
+    fn overload_buf(
+        overload: u8,
+        main_opts: &[u8],
+        sname_opts: &[u8],
+        file_opts: &[u8],
+    ) -> Vec<u8> {
+        let mut v = vec![1, 1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // op..flags (12)
+        v.extend_from_slice(&[0; 16]); // ciaddr, yiaddr, siaddr, giaddr
+        v.extend_from_slice(&[0; 16]); // chaddr
+        let mut sname = [0u8; 64];
+        sname[..sname_opts.len()].copy_from_slice(sname_opts);
+        v.extend_from_slice(&sname);
+        let mut file = [0u8; 128];
+        file[..file_opts.len()].copy_from_slice(file_opts);
+        v.extend_from_slice(&file);
+        v.extend_from_slice(&crate::v4::MAGIC);
+        v.extend_from_slice(main_opts);
+        v.extend_from_slice(&[52, 1, overload]);
+        v.push(255);
+        v
+    }
+
+    #[test]
+    fn test_option_overload_both() {
+        let sname_opts = [12u8, 4, b'h', b'o', b's', b't', 255];
+        let file_opts = [15u8, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 255];
+        let buf = overload_buf(3, &[53, 1, 1], &sname_opts, &file_opts);
+        let msg = Message::new(&buf).unwrap();
+
+        // plain opts() only sees the main options field
+        let main: Vec<_> = msg.opts().map(|o| o.code()).collect();
+        assert_eq!(main, [OptionCode::MessageType, OptionCode::OptionOverload]);
+
+        // opts_overloaded() chains file then sname
+        let all: Vec<_> = msg
+            .opts_overloaded()
+            .map(|o| (o.code(), o.data().to_vec()))
+            .collect();
+        assert_eq!(
+            all,
+            [
+                (OptionCode::MessageType, vec![1]),
+                (OptionCode::OptionOverload, vec![3]),
+                (OptionCode::DomainName, b"example".to_vec()), // from file
+                (OptionCode::Hostname, b"host".to_vec()),      // from sname
+            ]
+        );
+    }
+
+    #[test]
+    fn test_option_overload_file_only() {
+        let sname_opts = [12u8, 4, b'h', b'o', b's', b't', 255];
+        let file_opts = [15u8, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 255];
+        let buf = overload_buf(1, &[53, 1, 1], &sname_opts, &file_opts);
+        let msg = Message::new(&buf).unwrap();
+
+        // only `file` is overloaded; the sname option block is NOT parsed
+        let all: Vec<_> = msg.opts_overloaded().map(|o| o.code()).collect();
+        assert_eq!(
+            all,
+            [
+                OptionCode::MessageType,
+                OptionCode::OptionOverload,
+                OptionCode::DomainName,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_option_overload_absent() {
+        // overload value 0 => opts_overloaded() matches opts() (main field only)
+        let buf = overload_buf(0, &[53, 1, 1], b"srv", b"boot");
+        let msg = Message::new(&buf).unwrap();
+        let all: Vec<_> = msg.opts_overloaded().map(|o| o.code()).collect();
+        assert_eq!(all, [OptionCode::MessageType, OptionCode::OptionOverload]);
     }
 
     #[test]
