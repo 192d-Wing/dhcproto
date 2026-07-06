@@ -448,6 +448,24 @@ mod tests {
     }
 
     #[test]
+    fn test_option_overload_no_cross_region_reassembly() {
+        // opts_overloaded() is a raw view: a value split across regions is NOT
+        // reassembled (unlike the owned decoder, which yields "abcdef"). The
+        // fragments are yielded once per region for the caller to concatenate.
+        let file_opts = [15u8, 3, b'a', b'b', b'c', 255];
+        let sname_opts = [15u8, 3, b'd', b'e', b'f', 255];
+        let buf = overload_buf(3, &[53, 1, 1], &sname_opts, &file_opts);
+        let msg = Message::new(&buf).unwrap();
+
+        let domains: Vec<_> = msg
+            .opts_overloaded()
+            .filter(|o| o.code() == OptionCode::DomainName)
+            .map(|o| o.data().to_vec())
+            .collect();
+        assert_eq!(domains, [b"abc".to_vec(), b"def".to_vec()]);
+    }
+
+    #[test]
     fn test_option_overload_absent() {
         // overload value 0 => opts_overloaded() matches opts() (main field only)
         let buf = overload_buf(0, &[53, 1, 1], b"srv", b"boot");
