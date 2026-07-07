@@ -336,17 +336,48 @@ pub struct RelayMessage {
 }
 
 impl RelayMessage {
+    /// Construct a new relay message (e.g. a Relay-reply) with no options.
+    pub fn new(
+        msg_type: MessageType,
+        hop_count: u8,
+        link_addr: Ipv6Addr,
+        peer_addr: Ipv6Addr,
+    ) -> Self {
+        Self {
+            msg_type,
+            hop_count,
+            link_addr,
+            peer_addr,
+            opts: DhcpOptions::new(),
+        }
+    }
     pub fn msg_type(&self) -> MessageType {
         self.msg_type
+    }
+    pub fn set_msg_type(&mut self, msg_type: MessageType) -> &mut Self {
+        self.msg_type = msg_type;
+        self
     }
     pub fn hop_count(&self) -> u8 {
         self.hop_count
     }
+    pub fn set_hop_count(&mut self, hop_count: u8) -> &mut Self {
+        self.hop_count = hop_count;
+        self
+    }
     pub fn link_addr(&self) -> Ipv6Addr {
         self.link_addr
     }
+    pub fn set_link_addr(&mut self, link_addr: Ipv6Addr) -> &mut Self {
+        self.link_addr = link_addr;
+        self
+    }
     pub fn peer_addr(&self) -> Ipv6Addr {
         self.peer_addr
+    }
+    pub fn set_peer_addr(&mut self, peer_addr: Ipv6Addr) -> &mut Self {
+        self.peer_addr = peer_addr;
+        self
     }
     /// Get a reference to the message's options.
     pub fn opts(&self) -> &DhcpOptions {
