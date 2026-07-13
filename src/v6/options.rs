@@ -593,10 +593,19 @@ impl Decodable for DhcpOption {
                 DhcpOption::Authentication(Authentication::decode(&mut dec)?)
             }
             OptionCode::ServerUnicast => DhcpOption::ServerUnicast(decoder.read::<16>()?.into()),
-            OptionCode::StatusCode => DhcpOption::StatusCode(StatusCode {
-                status: decoder.read_u16()?.into(),
-                msg: decoder.read_string(len - core::mem::size_of::<u16>())?,
-            }),
+            OptionCode::StatusCode => {
+                // guard `len - 2` against a declared option length shorter than
+                // the fixed 2-byte status code (a crafted/truncated option would
+                // otherwise underflow: a debug-build panic, a huge read in
+                // release). Treat it as a malformed option.
+                let msg_len = len
+                    .checked_sub(core::mem::size_of::<u16>())
+                    .ok_or(super::DecodeError::NotEnoughBytes)?;
+                DhcpOption::StatusCode(StatusCode {
+                    status: decoder.read_u16()?.into(),
+                    msg: decoder.read_string(msg_len)?,
+                })
+            }
             OptionCode::RapidCommit => DhcpOption::RapidCommit,
             OptionCode::UserClass => {
                 let buf = decoder.read_slice(len)?;
@@ -606,19 +615,28 @@ impl Decodable for DhcpOption {
             }
             OptionCode::VendorClass => {
                 let num = decoder.read_u32()?;
-                let buf = decoder.read_slice(len - 4)?;
+                // guard `len - 4` against a length shorter than the enterprise
+                // number (malformed option) rather than underflowing.
+                let data_len = len
+                    .checked_sub(core::mem::size_of::<u32>())
+                    .ok_or(super::DecodeError::NotEnoughBytes)?;
+                let buf = decoder.read_slice(data_len)?;
                 DhcpOption::VendorClass(VendorClass {
                     num,
                     data: decode_data(&mut Decoder::new(buf)),
                 })
             }
-            OptionCode::VendorOpts => DhcpOption::VendorOpts(VendorOpts {
-                num: decoder.read_u32()?,
-                opts: {
-                    let mut opt_decoder = Decoder::new(decoder.read_slice(len - 4)?);
-                    DhcpOptions::decode(&mut opt_decoder)?
-                },
-            }),
+            OptionCode::VendorOpts => {
+                let num = decoder.read_u32()?;
+                let opts_len = len
+                    .checked_sub(core::mem::size_of::<u32>())
+                    .ok_or(super::DecodeError::NotEnoughBytes)?;
+                let mut opt_decoder = Decoder::new(decoder.read_slice(opts_len)?);
+                DhcpOption::VendorOpts(VendorOpts {
+                    num,
+                    opts: DhcpOptions::decode(&mut opt_decoder)?,
+                })
+            }
             OptionCode::InterfaceId => DhcpOption::InterfaceId(decoder.read_slice(len)?.to_vec()),
             OptionCode::ReconfMsg => DhcpOption::ReconfMsg(decoder.read_u8()?.into()),
             OptionCode::ReconfAccept => DhcpOption::ReconfAccept,

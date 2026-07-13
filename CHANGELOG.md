@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1]
+
+### Fixed
+
+- Harden DHCPv6 option decoding against malformed/truncated options whose
+  declared length is shorter than the option's fixed header. `StatusCode`
+  (`len - 2`), `VendorClass` and `VendorOpts` (`len - 4`) computed the
+  variable-length remainder with an unchecked subtraction, so a crafted option
+  with an undersized length underflowed: a panic in debug builds, and a
+  huge-length read in release builds (caught by the slice bounds check, but only
+  after the wrapping). These now use `checked_sub` and return
+  `DecodeError::NotEnoughBytes` for such options. Reachable from untrusted input
+  via the DHCPv6 relay-message decode path.
+
 ## [0.19.0]
 
 ### Changed
